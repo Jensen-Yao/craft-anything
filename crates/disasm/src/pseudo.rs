@@ -177,7 +177,7 @@ impl Lifter<'_> {
             parts.push(b.clone());
         }
         if let Some(i) = &m.index {
-            parts.push(if m.scale > 1 { format!("{i} * {}", m.scale) } else { i.clone() });
+            parts.push(self.index_expr(i, m));
         }
         if m.disp != 0 || parts.is_empty() {
             parts.push(imm(m.disp));
@@ -206,12 +206,22 @@ impl Lifter<'_> {
             parts.push(b.clone());
         }
         if let Some(i) = &m.index {
-            parts.push(if m.scale > 1 { format!("{i} * {}", m.scale) } else { i.clone() });
+            parts.push(self.index_expr(i, m));
         }
         if m.disp != 0 || parts.is_empty() {
             parts.push(imm(m.disp));
         }
         format!("*({}*)({})", ty(m.size), parts.join(" + ").replace("+ -", "- "))
+    }
+
+    /// An index register as it enters the address: extended when the instruction extends it
+    /// (`[x1, w2, sxtw #2]`), scaled when the encoding only says a scale (x86), plain otherwise.
+    fn index_expr(&mut self, index: &str, m: &MemOp) -> String {
+        match m.index_shift {
+            Some(s) => shifted(index, s.shift, s.amount),
+            None if m.scale > 1 => format!("{index} * {}", m.scale),
+            None => index.to_string(),
+        }
     }
 
     fn op(&mut self, o: &Op) -> String {
@@ -1374,6 +1384,27 @@ mod tests {
         let program = Program::analyze(&image, &Limits::default(), &NoControl).unwrap();
         let f = program.functions.get(&0x1000).unwrap();
         lift(&image, &program, f, &|_| None)
+    }
+
+    /// `ldr w0, [x1, w2, sxtw #2]` read the index as the plain register, so the address lost
+    /// the sign extension (R3.11).
+    #[test]
+    fn aarch64_extended_memory_indices_keep_the_extension() {
+        // ldr w0, [x1, w2, sxtw #2]; ldr x6, [x7, x8, lsl #3]; ldr x24, [x25, w26, uxtw];
+        // ldr x15, [x16, x17]; str w9, [x10, w11, sxtw #2]; ret
+        let words = [0xb862_d820u32, 0xf868_78e6, 0xf87a_4b38, 0xf871_6a0f, 0xb82b_d949, 0xd65f_03c0];
+        let p = lift_a64(&words);
+        for want in [
+            "w0 = *(void*)(x1 + ((int64_t)(int32_t)w2 << 2));",
+            "x6 = *(void*)(x7 + (x8 << 3));",
+            "x24 = *(void*)(x25 + (uint32_t)w26);",
+            "x15 = *(void*)(x16 + x17);",
+            "*(void*)(x10 + ((int64_t)(int32_t)w11 << 2)) = w9;",
+        ] {
+            assert!(p.text.contains(want), "{want}\n{}", p.text);
+        }
+        assert!(!p.text.contains("*(void*)(x1 + x2)"), "{}", p.text);
+        assert!(!p.text.contains("*(void*)(x10 + x11)"), "{}", p.text);
     }
 
     /// `mov x19, x0` came out as `x19 = xzr;`: the zero register of its ORR form was taken as the value.
