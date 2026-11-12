@@ -1662,7 +1662,7 @@ Owner: open · Status: in progress
       `w9 = 0x92490000;`, dropping the low half set just before, and `mov w0, #-1` (MOVN) to
       `w0 = 0;`. Keep MOVK's other bits and invert MOVN's immediate
       — claimed: htcom-code, branch bugfix/r3.11-a64-move-wide-immediates
-- [ ] Fold an AArch64 MOVZ/MOVK sequence into one constant in pseudo-C: `mov w9, #0x2493` then
+- [x] Fold an AArch64 MOVZ/MOVK sequence into one constant in pseudo-C: `mov w9, #0x2493` then
       `movk w9, #0x9249, lsl #16` reads as two statements, not `w9 = 0x92492493;`
       — claimed: Jensen-Yao, branch bugfix/r3.11-a64-movz-movk-constants
 - [x] Enforce stand-in per-body and total byte budgets on the text that is actually retained after redaction;

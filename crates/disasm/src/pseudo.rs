@@ -286,6 +286,9 @@ impl Lifter<'_> {
         let mut stmts: Vec<String> = Vec::new();
         // canonical reg → (statement index, expression) of its latest assignment in this block
         let mut defs: BTreeMap<String, (usize, String)> = BTreeMap::new();
+        // canonical reg → (statement index, value) while that assignment is a plain constant,
+        // so a following MOVK can fold with it
+        let mut consts: BTreeMap<String, (usize, u64)> = BTreeMap::new();
         let mut pushes: Vec<String> = Vec::new();
         let mut flag_src: Option<&Insn> = None;
         let mut cond = None;
@@ -314,10 +317,17 @@ impl Lifter<'_> {
                         | "stxp"
                         | "stlxp"
                 );
+            // The constant a MOVK is about to fold with, before its own read of the destination
+            // hides the assignment (the read-removal below is what makes the pair two statements).
+            let insert_dst = (self.mode == Mode::A64 && i.kind == Kind::Insert)
+                .then(|| i.ops.first().and_then(|o| if let Op::Reg(r) = o { Some(canonical_reg(r)) } else { None }))
+                .flatten();
+            let insert_src = insert_dst.as_ref().and_then(|r| consts.get(r).copied());
             // A register read by a later instruction keeps its assignment.
             if !matches!(i.flow, Flow::Call { .. } | Flow::IndirectCall { .. }) {
                 for r in &i.reads {
                     defs.remove(r);
+                    consts.remove(r);
                 }
             }
             // AArch64 page loads and import-slot loads are shown through what uses them.
@@ -328,6 +338,8 @@ impl Lifter<'_> {
             let s = i.ops.get(1).map(|o| self.op(o));
             let t = i.ops.get(2).map(|o| self.op(o));
             let mut stmt: Option<String> = None;
+            // set when this statement leaves its destination holding a known constant
+            let mut const_def: Option<(String, u64)> = None;
             let dest_reg = match i.ops.first() {
                 Some(Op::Reg(r)) => Some(canonical_reg(r)),
                 _ => None,
@@ -399,6 +411,7 @@ impl Lifter<'_> {
                     stmt = Some(if uses_ret == Some(true) { format!("{} = {call};", self.ret_reg_name()) } else { format!("{call};") });
                     // Calls clobber argument registers.
                     defs.clear();
+                    consts.clear();
                 }
                 (_, Flow::Return) => {
                     stmt = Some(if self.ret_reg.is_empty() { "return;".into() } else { format!("return {};", self.ret_reg) });
@@ -451,11 +464,28 @@ impl Lifter<'_> {
                     } else {
                         stmt = Some(format!("{dd} = {ss};"));
                     }
+                    // A register set to a plain immediate holds a constant a MOVK can fold with
+                    // (a W register's constant lives in the low 32 bits).
+                    if let (Some(Op::Reg(r)), Some(Op::Imm(v))) = (i.ops.first(), i.ops.get(1)) {
+                        let value = if r.starts_with('w') { u64::from(*v as u32) } else { *v as u64 };
+                        const_def = Some((canonical_reg(r), value));
+                    }
                 }
                 (Kind::Insert, _) => match (i.ops.get(1), i.ops.get(2)) {
                     (Some(Op::Imm(v)), Some(Op::Imm(keep))) => {
                         let dd = d.clone().unwrap_or_default();
-                        stmt = Some(format!("{dd} = ({dd} & {:#x}) | {:#x};", *keep as u64, *v as u64));
+                        // A MOVZ (or an earlier folded MOVK) beside this MOVK is one constant:
+                        // fold the pair into a single assignment.
+                        if let (Some((idx, base)), Some(dr)) = (insert_src, dest_reg.as_ref())
+                            && !dead.contains(&idx)
+                        {
+                            let combined = (base & (*keep as u64)) | (*v as u64);
+                            dead.insert(idx);
+                            stmt = Some(format!("{dd} = {};", imm(combined as i64)));
+                            const_def = Some((dr.clone(), combined));
+                        } else {
+                            stmt = Some(format!("{dd} = ({dd} & {:#x}) | {:#x};", *keep as u64, *v as u64));
+                        }
                     }
                     _ => {
                         self.asm_fallbacks += 1;
@@ -582,11 +612,20 @@ impl Lifter<'_> {
                             defs.remove(r);
                         }
                     }
+                    match const_def {
+                        Some((cr, v)) if cr == *r => {
+                            consts.insert(r.clone(), (stmts.len() - 1, v));
+                        }
+                        _ => {
+                            consts.remove(r);
+                        }
+                    }
                 }
             }
             for w in &i.writes {
                 if dest_reg.as_ref() != Some(w) {
                     defs.remove(w);
+                    consts.remove(w);
                 }
             }
             // Moving the stack pointer shifts every slot: forget the pending stack arguments.
@@ -1386,6 +1425,31 @@ mod tests {
         lift(&image, &program, f, &|_| None)
     }
 
+    /// `mov w9, #0x2493` followed by `movk w9, #0x9249, lsl #16` read as two statements, not
+    /// one constant (R3.11).
+    #[test]
+    fn aarch64_movz_movk_pairs_fold_into_one_constant() {
+        // mov w9, #0x2493; movk w9, #0x9249, lsl #16
+        let p = lift_a64(&[0x5284_9269, 0x72b2_4929, 0xd65f_03c0]);
+        assert!(p.text.contains("w9 = 0x92492493;"), "{}", p.text);
+        assert!(!p.text.contains("(w9 & "), "{}", p.text);
+
+        // mov x10, #0x1122; movk ×4: the whole 64-bit constant, one statement
+        let p = lift_a64(&[0xd282_244a, 0xf2a6_688a, 0xf2ca_acca, 0xf2ee_f10a, 0xd65f_03c0]);
+        assert!(p.text.contains("x10 = 0x7788556633441122;"), "{}", p.text);
+        assert!(!p.text.contains("(x10 & "), "{}", p.text);
+
+        // A W pair over a MOVN keeps its inverted low half
+        let p = lift_a64(&[0x1280_000d, 0x72b2_492d, 0xd65f_03c0]);
+        assert!(p.text.contains("w13 = 0x9249ffff;"), "{}", p.text);
+
+        // A read between the pair keeps both statements
+        let p = lift_a64(&[0xd284_926e, 0x8b0e_01cf, 0xf2b2_492e, 0xd65f_03c0]);
+        assert!(p.text.contains("x14 = 0x2493;"), "{}", p.text);
+        assert!(p.text.contains("x15 = x14 + x14;"), "{}", p.text);
+        assert!(p.text.contains("x14 = (x14 & 0xffffffff0000ffff) | 0x92490000;"), "{}", p.text);
+    }
+
     /// `ldr w0, [x1, w2, sxtw #2]` read the index as the plain register, so the address lost
     /// the sign extension (R3.11).
     #[test]
@@ -1518,8 +1582,9 @@ mod tests {
         let image = Image::raw(Arc::from(bytes), craft_anything_formats::Arch::Aarch64, 0x1000);
         let program = Program::analyze(&image, &Limits::default(), &NoControl).unwrap();
         let p = lift(&image, &program, program.functions.get(&0x1000).unwrap(), &|_| None);
-        assert!(p.text.contains("w9 = 0x2493;"), "{}", p.text);
-        assert!(p.text.contains("w9 = (w9 & 0xffff) | 0x92490000;"), "{}", p.text);
+        // The pair folds into one constant, whose low half is the MOVZ's
+        assert!(p.text.contains("w9 = 0x92492493;"), "{}", p.text);
+        assert!(!p.text.contains("w9 = 0x92490000;"), "{}", p.text);
         assert!(p.text.contains("w0 = -1;") && !p.text.contains("w0 = 0;"), "{}", p.text);
         assert_eq!(p.asm_fallbacks, 0, "{}", p.text);
     }
