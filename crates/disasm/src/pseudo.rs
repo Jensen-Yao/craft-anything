@@ -332,6 +332,12 @@ impl Lifter<'_> {
             }
             // AArch64 page loads and import-slot loads are shown through what uses them.
             if i.kind == Kind::Adrp || (!exclusive_memory && i.kind == Kind::Load && i.refs.first().is_some_and(|r| self.prog.import_slots.contains_key(r))) {
+                // The skipped instruction still overwrites its destination: no constant or
+                // assignment from before it survives.
+                for w in &i.writes {
+                    defs.remove(w);
+                    consts.remove(w);
+                }
                 continue;
             }
             let d = i.ops.first().map(|o| self.op(o));
@@ -1448,6 +1454,11 @@ mod tests {
         assert!(p.text.contains("x14 = 0x2493;"), "{}", p.text);
         assert!(p.text.contains("x15 = x14 + x14;"), "{}", p.text);
         assert!(p.text.contains("x14 = (x14 & 0xffffffff0000ffff) | 0x92490000;"), "{}", p.text);
+        // A page load between the pair overwrites the register: the MOVK folds with nothing
+        let p = lift_a64(&[0xd284_9269, 0x9000_0009, 0xf2b2_4929, 0xd65f_03c0]);
+        assert!(p.text.contains("x9 = 0x2493;"), "{}", p.text);
+        assert!(p.text.contains("x9 = (x9 & 0xffffffff0000ffff) | 0x92490000;"), "{}", p.text);
+        assert!(!p.text.contains("x9 = 0x92492493;"), "{}", p.text);
     }
 
     /// `ldr w0, [x1, w2, sxtw #2]` read the index as the plain register, so the address lost
