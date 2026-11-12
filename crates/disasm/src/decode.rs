@@ -768,12 +768,14 @@ fn decode_a64(bytes: &[u8], addr: u64, fmt: bool) -> Option<Insn> {
                 // zero-extended form, as for arithmetic operands.
                 let style = if style == ShiftStyle::LSL && size == A64Size::W { ShiftStyle::UXTW } else { style };
                 let shift = a64_shift(style);
-                // Shifting by nothing, or extending a register to its own width, leaves the
-                // index unchanged; every other extension changes the address and is kept.
-                let unchanged = matches!(shift, Shift::Lsl | Shift::Uxtx | Shift::Sxtx) && sh == 0;
+                // The zero register offsets by zero whatever it is extended to: it is no index.
+                // Shifting by nothing, or extending a register to its own width, likewise
+                // leaves the index unchanged; every other extension is kept.
+                let index = a64_canon(m, false).map(|_| a64_reg(size, m, false));
+                let unchanged = index.is_none() || matches!(shift, Shift::Lsl | Shift::Uxtx | Shift::Sxtx) && sh == 0;
                 ops.push(Op::Mem(MemOp {
                     base: a64_canon(n, true),
-                    index: Some(a64_reg(size, m, false)),
+                    index,
                     index_shift: (!unchanged).then_some(IndexShift { shift, amount: sh }),
                     scale: 1,
                     disp: 0,
@@ -1460,10 +1462,10 @@ mod tests {
     #[test]
     fn a64_memory_index_extensions_are_kept() {
         let reg = |r: &str| Op::Reg(r.into());
-        let mem = |base: &str, index: &str, shift: Option<(Shift, u8)>| {
+        let mem = |base: &str, index: Option<&str>, shift: Option<(Shift, u8)>| {
             Op::Mem(MemOp {
                 base: Some(base.into()),
-                index: Some(index.into()),
+                index: index.map(|i| i.into()),
                 index_shift: shift.map(|(shift, amount)| IndexShift { shift, amount }),
                 scale: 1,
                 disp: 0,
@@ -1475,13 +1477,13 @@ mod tests {
         // Words assembled from the encoding the ARM architecture gives register-offset loads and
         // stores, checked against LLVM's disassembler; S=1 fixes the amount to the access size.
         let cases: &[(u32, &str, Vec<Op>)] = &[
-            (0xb862_d820, "ldr w0, [x1, w2, sxtw #2]", vec![reg("w0"), mem("x1", "w2", Some((Shift::Sxtw, 2)))]),
-            (0xb865_5883, "ldr w3, [x4, w5, uxtw #2]", vec![reg("w3"), mem("x4", "w5", Some((Shift::Uxtw, 2)))]),
-            (0xf868_78e6, "ldr x6, [x7, x8, lsl #3]", vec![reg("x6"), mem("x7", "x8", Some((Shift::Lsl, 3)))]),
-            (0xf871_6a0f, "ldr x15, [x16, x17]", vec![reg("x15"), mem("x16", "x17", None)]),
-            (0xb8b7_dad5, "ldrsw x21, [x22, w23, sxtw #2]", vec![reg("x21"), mem("x22", "w23", Some((Shift::Sxtw, 2)))]),
-            (0xf87a_4b38, "ldr x24, [x25, w26, uxtw]", vec![reg("x24"), mem("x25", "w26", Some((Shift::Uxtw, 0)))]),
-            (0xf87d_fb9b, "ldr x27, [x28, x29, sxtx #3]", vec![reg("x27"), mem("x28", "x29", Some((Shift::Sxtx, 3)))]),
+            (0xb862_d820, "ldr w0, [x1, w2, sxtw #2]", vec![reg("w0"), mem("x1", Some("w2"), Some((Shift::Sxtw, 2)))]),
+            (0xb865_5883, "ldr w3, [x4, w5, uxtw #2]", vec![reg("w3"), mem("x4", Some("w5"), Some((Shift::Uxtw, 2)))]),
+            (0xf868_78e6, "ldr x6, [x7, x8, lsl #3]", vec![reg("x6"), mem("x7", Some("x8"), Some((Shift::Lsl, 3)))]),
+            (0xf871_6a0f, "ldr x15, [x16, x17]", vec![reg("x15"), mem("x16", Some("x17"), None)]),
+            (0xb8b7_dad5, "ldrsw x21, [x22, w23, sxtw #2]", vec![reg("x21"), mem("x22", Some("w23"), Some((Shift::Sxtw, 2)))]),
+            (0xf87a_4b38, "ldr x24, [x25, w26, uxtw]", vec![reg("x24"), mem("x25", Some("w26"), Some((Shift::Uxtw, 0)))]),
+            (0xf87d_fb9b, "ldr x27, [x28, x29, sxtx #3]", vec![reg("x27"), mem("x28", Some("x29"), Some((Shift::Sxtx, 3)))]),
         ];
         for (word, name, ops) in cases {
             let i = decode(Mode::A64, &word.to_le_bytes(), 0x1000, true).unwrap();
@@ -1489,12 +1491,15 @@ mod tests {
         }
         // A store keeps its extended target address too.
         let i = decode(Mode::A64, &0xb82b_d949u32.to_le_bytes(), 0x1000, true).unwrap();
-        assert_eq!(i.ops, vec![reg("w9"), mem("x10", "w11", Some((Shift::Sxtw, 2)))], "{}", i.operands);
+        assert_eq!(i.ops, vec![reg("w9"), mem("x10", Some("w11"), Some((Shift::Sxtw, 2)))], "{}", i.operands);
         let i = decode(Mode::A64, &0x7834_da72u32.to_le_bytes(), 0x1000, true).unwrap();
-        assert_eq!(i.ops, vec![reg("w18"), mem("x19", "w20", Some((Shift::Sxtw, 1)))], "{}", i.operands);
+        assert_eq!(i.ops, vec![reg("w18"), mem("x19", Some("w20"), Some((Shift::Sxtw, 1)))], "{}", i.operands);
         // The extended index is still read, by its full-width name.
         let i = decode(Mode::A64, &0xb862_d820u32.to_le_bytes(), 0x1000, true).unwrap();
         assert!(i.reads.contains(&"x1".to_string()) && i.reads.contains(&"x2".to_string()), "{i:?}");
+        // The zero register offsets by zero: it is no index, not a `wzr`/`xzr` one.
+        let i = decode(Mode::A64, &0xf87f_6830u32.to_le_bytes(), 0x1000, true).unwrap();
+        assert_eq!(i.ops, vec![reg("x16"), mem("x1", None, None)], "{}", i.operands);
     }
 
     #[test]
